@@ -1,18 +1,18 @@
 {
-  "MXC 14mK": {
+  "12mK": {
     "antiwindup": true,
     "controller_ip": "localhost",
     "controller_timeout": 10.0,
-    "dt": 30.0,
+    "dt": 37.0,
     "heater_channel": 4,
     "keep_integral_on_tune": true,
-    "ki": 1e-05,
-    "kp": 0.01,
+    "ki": 0.1,
+    "kp": 150.0,
     "reset_integral_on_start": true,
-    "setpoint": 0.014,
+    "setpoint": 0.012,
     "temp_channel": 6,
-    "u_ff": 3.0,
-    "u_max": 20.0,
+    "u_ff": 2.0,
+    "u_max": 8.0,
     "u_min": 0.0
   }
 }

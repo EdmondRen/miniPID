@@ -28,8 +28,11 @@ import json
 import os
 import threading
 import time
+import traceback
 import tkinter as tk
 import requests
+from collections import deque
+from statistics import stdev
 from tkinter import ttk, messagebox, simpledialog
 
 PRESET_FILE = "pi_ff_presets.json"
@@ -153,15 +156,18 @@ class BlueforsController:
     def set_heater(self, power_uW: float, channel_number: int = None):
         if channel_number is None:
             channel_number = self.CHANNEL_NUMBER_HEAT
-        url = 'http://{}:5001//heater/update'.format(self.DEVICE_IP)
+        url = 'http://{}:5001/heater/update'.format(self.DEVICE_IP)
         data = {
-            'channel_nr': channel_number,
+            'heater_nr': channel_number,
+            'pid_mode' : 0, # 0 for manual power control, 1 for PID control
             'power': power_uW * 1e-6, # Applied manual power in Watts. The maximum power is 100 mA
+            # 'power': '0.000001', # Applied manual power in Watts. The maximum power is 100 mA
         }
-        print(data)
-        # req = requests.post(url, json=data, timeout=self.TIMEOUT)
-        # req.raise_for_status()
-        # rtn = req.json()
+        print("Sending command:", data)
+        req = requests.post(url, json=data, timeout=self.TIMEOUT)
+        req.raise_for_status()
+        rtn = req.json()
+        print("Response:", rtn)
 
         return 
 
@@ -262,6 +268,7 @@ class App(tk.Tk):
 
         # Presets
         self.presets = load_presets()
+        self.temp_history = deque(maxlen=100)
 
         # Tk variables
         self.var_setpoint = tk.DoubleVar(value=0.050)     # e.g. K
@@ -283,6 +290,7 @@ class App(tk.Tk):
 
         # Live readouts
         self.var_temp = tk.StringVar(value="—")
+        self.var_temp_std = tk.StringVar(value="—")
         self.var_error = tk.StringVar(value="—")
         self.var_u_cmd = tk.StringVar(value="—")
         self.var_p_term = tk.StringVar(value="—")
@@ -319,10 +327,11 @@ class App(tk.Tk):
 
         self.btn_connect = ttk.Button(controller_frame, text="Connect", command=self.connect_controller)
         self.btn_connect.grid(row=0, column=4, rowspan=2, sticky="w", padx=(12, 0))
+        ttk.Button(controller_frame, text="Help", command=self._show_help).grid(row=3, column=4, rowspan=2, sticky="w", padx=(12, 0))
 
         self.connection_indicator = tk.Label(controller_frame, width=2, bg="#b91c1c", relief="groove")
         self.connection_indicator.grid(row=0, column=5, rowspan=2, sticky="w", padx=(12, 4))
-        ttk.Label(controller_frame, textvariable=self.var_connection_status).grid(row=2, column=4, rowspan=2, sticky="w")
+        ttk.Label(controller_frame, textvariable=self.var_connection_status).grid(row=1, column=4, rowspan=4, sticky="w", padx=(16, 0))
 
         # Top: parameters
         frm = ttk.Frame(self)
@@ -366,17 +375,22 @@ class App(tk.Tk):
         live = ttk.LabelFrame(self, text="Live")
         live.grid(row=2, column=0, sticky="nsew", **pad)
         live.columnconfigure(1, weight=1)
+        live.columnconfigure(2, weight=1)
+
+        temp_value = ttk.Label(live, textvariable=self.var_temp, font=("TkDefaultFont", 18, "bold"))
+        ttk.Label(live, text="Temperature").grid(row=0, column=0, sticky="w", padx=8, pady=3)
+        temp_value.grid(row=0, column=1, sticky="w", padx=8, pady=3)
 
         def live_row(r, name, var):
             ttk.Label(live, text=name).grid(row=r, column=0, sticky="w", padx=8, pady=3)
             ttk.Label(live, textvariable=var).grid(row=r, column=1, sticky="w", padx=8, pady=3)
 
-        live_row(0, "Temperature", self.var_temp)
-        live_row(1, "Error (SP - T)", self.var_error)
-        live_row(2, "Heater power", self.var_u_cmd)
-        live_row(3, "  P term", self.var_p_term)
-        live_row(4, "  I term", self.var_i_term)
-        live_row(5, "Status", self.var_status)
+        live_row(1, "Std dev (last 100)", self.var_temp_std)
+        live_row(2, "Error (SP - T)", self.var_error)
+        live_row(3, "Heater power", self.var_u_cmd)
+        live_row(4, "  P term", self.var_p_term)
+        live_row(5, "  I term", self.var_i_term)
+        live_row(6, "Status", self.var_status)
 
         # Presets
         presets = ttk.LabelFrame(self, text="Presets")
@@ -400,6 +414,14 @@ class App(tk.Tk):
     def _set_connection_status(self, text, color):
         self.var_connection_status.set(text)
         self.connection_indicator.configure(bg=color)
+
+    def _show_help(self):
+        messagebox.showinfo(
+            "Help",
+            "Connect to the controller, verify the thermometer and heater channels, "
+            "then start the PI loop. The live panel shows the latest temperature and "
+            "the rolling standard deviation of the last 100 measurements.",
+        )
 
     @staticmethod
     def _short_error_text(exc, max_len=48):
@@ -493,6 +515,13 @@ class App(tk.Tk):
         self.pi.reset_integral()
         self.var_i_term.set(f"{self.pi.integral_uW:.6g} µW")
 
+    def _record_temperature(self, temperature):
+        self.temp_history.append(float(temperature))
+        if len(self.temp_history) >= 2:
+            self.var_temp_std.set(f"{stdev(self.temp_history):.6f} K")
+        else:
+            self.var_temp_std.set("—")
+
     def _control_tick(self):
         if not self.running:
             return
@@ -518,6 +547,7 @@ class App(tk.Tk):
             self.after(250, self._control_tick)
             return
         except Exception as e:
+            traceback.print_exc()
             self.var_status.set(f"Error reading temperature: {e}")
             self.stop()
             return
@@ -546,13 +576,15 @@ class App(tk.Tk):
         try:
             self.controller.set_heater(u_cmd, channel_number=int(self.var_heater_channel.get()))
         except Exception as e2:
+            traceback.print_exc()
             self.var_status.set(f"Error setting heater: {e2}")
             self.stop()
             return
 
         # Update readouts
-        self.var_temp.set(f"{T:.3f} K")
-        self.var_error.set(f"{e:.3f} K")
+        self._record_temperature(T)
+        self.var_temp.set(f"{T:.4f} K")
+        self.var_error.set(f"{e:.4f} K")
         self.var_u_cmd.set(f"{u_cmd:.4f} µW")
         self.var_p_term.set(f"{p_term:.4f} µW")
         self.var_i_term.set(f"{i_term:.4f} µW")
@@ -565,7 +597,8 @@ class App(tk.Tk):
             return
         try:
             T = float(self.controller.get_temperature(channel_number=int(self.var_temp_channel.get())))
-            self.var_temp.set(f"{T:.3f} K")
+            self._record_temperature(T)
+            self.var_temp.set(f"{T:.4f} K")
         except LookupError:
             pass
         except Exception:
