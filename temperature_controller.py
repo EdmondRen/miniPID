@@ -1,5 +1,5 @@
 """
-PI + feedforward temperature control GUI (Tkinter)
+PID + feedforward temperature control GUI (Tkinter)
 
 Assumptions:
 - You have an object named `controller` providing:
@@ -165,16 +165,16 @@ class BlueforsController:
         }
         print("Sending command:", data)
         
-        # req = requests.post(url, json=data, timeout=self.TIMEOUT)
-        # req.raise_for_status()
-        # rtn = req.json()
+        req = requests.post(url, json=data, timeout=self.TIMEOUT)
+        req.raise_for_status()
+        rtn = req.json()
         
         # print("Response:", rtn)
 
         return 
 
 # ----------------------------------------------------------------------
-# Core PI+FF controller logic (discrete time)
+# Core PID+FF controller logic (discrete time)
 # ----------------------------------------------------------------------
 class PIDWithFeedforward:
     def __init__(self):
@@ -285,7 +285,7 @@ def save_presets(presets: dict):
 class App(tk.Tk):
     def __init__(self, controller_factory):
         super().__init__()
-        self.title("PI+Feedforward Temp Ctrl")
+        self.title("PID+Feedforward Temp Ctrl")
         self.controller_factory = controller_factory
         self.controller = None
 
@@ -412,7 +412,7 @@ class App(tk.Tk):
         
         ttk.Label(frm, text="""PID+FF control equation:
     e = setpoint - measurement
-    u = u_ff + Kp*e + sum(Ki * e * dt) - Kd * de/dt""").grid(row=11, column=0, sticky="w")              
+    u = u_ff + Kp * e + Ki * sum(e*dt) - Kd * de/dt""").grid(row=11, column=0, columnspan=3, sticky="w")              
 
         # Live readouts
         live = ttk.LabelFrame(self, text="Live")
