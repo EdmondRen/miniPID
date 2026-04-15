@@ -9,7 +9,7 @@ Assumptions:
 What you get:
 - Start/Stop loop (updates each sample)
 - Feedforward term (u_ff)
-- PI control: u = u_ff + Kp*e + I
+- PID control: u = u_ff + Kp*e + sum(Ki * e * dt) - Kd * de/dt
 - Integral handling:
     - Reset integral on Start (optional)
     - Reset or keep integral when you change Kp/Ki while running
@@ -115,7 +115,7 @@ class BlueforsController:
                 with self._measurement_lock:
                     self._latest_by_channel[channel_number] = {
                         "temperature": temperature,
-                        "timestamp": time.time(),
+                        "timestamp": data["timestamp"],
                     }
                     self._last_poll_error = None
                 self._measurement_event.set()
@@ -163,10 +163,12 @@ class BlueforsController:
             'power': power_uW * 1e-6, # Applied manual power in Watts. The maximum power is 100 mA
             # 'power': '0.000001', # Applied manual power in Watts. The maximum power is 100 mA
         }
-        # print("Sending command:", data)
-        req = requests.post(url, json=data, timeout=self.TIMEOUT)
-        req.raise_for_status()
-        rtn = req.json()
+        print("Sending command:", data)
+        
+        # req = requests.post(url, json=data, timeout=self.TIMEOUT)
+        # req.raise_for_status()
+        # rtn = req.json()
+        
         # print("Response:", rtn)
 
         return 
@@ -174,7 +176,7 @@ class BlueforsController:
 # ----------------------------------------------------------------------
 # Core PI+FF controller logic (discrete time)
 # ----------------------------------------------------------------------
-class PIWithFeedforward:
+class PIDWithFeedforward:
     def __init__(self):
         self.integral_uW = 0.0  # integral contribution already in µW
         self.measurement_history = deque()
@@ -186,7 +188,7 @@ class PIWithFeedforward:
         self.integral_uW = 0.0
         self.measurement_history.clear()
 
-    def update(self, setpoint, measurement, kp, ki_per_s, kd, deriv_points, dt_s, u_ff,
+    def update(self, setpoint, measurement, kp, ki_per_s, kd, deriv_points, dt_s, sample_time_s, u_ff,
                u_min, u_max, antiwindup=True):
         """
         Returns (u_cmd, error, p_term, i_term, d_term)
@@ -194,8 +196,9 @@ class PIWithFeedforward:
         Implementation:
           e = setpoint - measurement
           integral_uW += (ki * e * dt)
-          d_term = -kd * d(measurement)/dt
+          d_term = -kd * linear_fit_slope(measurement vs time)
           u = u_ff + kp*e + integral_uW + d_term
+          u = u_ff + Kp*e + sum(Ki * e * dt) - Kd * de/dt
 
         Anti-windup:
           If saturated and integration would drive further into saturation,
@@ -204,14 +207,21 @@ class PIWithFeedforward:
         e = setpoint - measurement
         p = kp * e
         window = max(2, int(deriv_points))
-        self.measurement_history.append(float(measurement))
+        self.measurement_history.append((float(sample_time_s), float(measurement)))
         while len(self.measurement_history) > window:
             self.measurement_history.popleft()
 
-        if len(self.measurement_history) >= 2 and dt_s > 0:
-            d_meas_dt = (
-                self.measurement_history[-1] - self.measurement_history[0]
-            ) / (dt_s * (len(self.measurement_history) - 1))
+        if len(self.measurement_history) >= 2:
+            times = [sample[0] for sample in self.measurement_history]
+            values = [sample[1] for sample in self.measurement_history]
+            t_mean = sum(times) / len(times)
+            y_mean = sum(values) / len(values)
+            numerator = sum((t - t_mean) * (y - y_mean) for t, y in zip(times, values))
+            denominator = sum((t - t_mean) ** 2 for t in times)
+            if denominator > 0:
+                d_meas_dt = numerator / denominator
+            else:
+                d_meas_dt = 0.0
         else:
             d_meas_dt = 0.0
         d = -kd * d_meas_dt
@@ -280,7 +290,7 @@ class App(tk.Tk):
         self.controller = None
 
         # Control
-        self.pi = PIWithFeedforward()
+        self.pid = PIDWithFeedforward()
         self.running = False
         self.last_update_time = None
 
@@ -354,7 +364,8 @@ class App(tk.Tk):
 
         self.connection_indicator = tk.Label(controller_frame, width=2, bg="#b91c1c", relief="groove")
         self.connection_indicator.grid(row=0, column=5, rowspan=2, sticky="w", padx=(12, 4))
-        ttk.Label(controller_frame, textvariable=self.var_connection_status).grid(row=1, column=4, rowspan=4, sticky="w", padx=(16, 0))
+        ttk.Label(controller_frame, textvariable=self.var_connection_status).grid(row=1, column=4, rowspan=4, sticky="w", padx=(16, 0))  
+        
 
         # Top: parameters
         frm = ttk.Frame(self)
@@ -367,6 +378,9 @@ class App(tk.Tk):
             ent.grid(row=r, column=1, sticky="w")
             ttk.Label(frm, text=unit).grid(row=r, column=2, sticky="w")
             return ent
+        
+        
+
 
         add_row(0, "Setpoint", self.var_setpoint, "K")
         add_row(1, "Kp", self.var_kp, "µW/K")
@@ -395,6 +409,10 @@ class App(tk.Tk):
         self.btn_start.grid(row=0, column=0, padx=(0, 8))
         self.btn_stop.grid(row=0, column=1, padx=(0, 8))
         ttk.Button(ctrl, text="Reset Integral Now", command=self._reset_integral_now).grid(row=0, column=2)
+        
+        ttk.Label(frm, text="""PID+FF control equation:
+    e = setpoint - measurement
+    u = u_ff + Kp*e + sum(Ki * e * dt) - Kd * de/dt""").grid(row=11, column=0, sticky="w")              
 
         # Live readouts
         live = ttk.LabelFrame(self, text="Live")
@@ -445,7 +463,7 @@ class App(tk.Tk):
         messagebox.showinfo(
             "Help",
             "Connect to the controller, verify the thermometer and heater channels, "
-            "then start the PI loop. The live panel shows the latest temperature and "
+            "then start the PI loop. \n The live panel shows the latest temperature and "
             "the rolling standard deviation of the last 100 measurements.",
         )
 
@@ -524,7 +542,7 @@ class App(tk.Tk):
             messagebox.showinfo("Controller", "Connect to the controller first.")
             return
         if self.var_reset_integral_on_start.get():
-            self.pi.reset_state()
+            self.pid.reset_state()
 
         self.running = True
         self.last_update_time = None
@@ -538,8 +556,8 @@ class App(tk.Tk):
         self._set_start_button_state()
 
     def _reset_integral_now(self):
-        self.pi.reset_integral()
-        self.var_i_term.set(f"{self.pi.integral_uW:.5f} µW")
+        self.pid.reset_integral()
+        self.var_i_term.set(f"{self.pid.integral_uW:.5f} µW")
         self.var_d_term.set("—")
 
     def _record_temperature(self, temperature):
@@ -589,7 +607,7 @@ class App(tk.Tk):
         u_max = float(self.var_u_max.get())
         antiwindup = bool(self.var_antiwindup.get())
 
-        u_cmd, e, p_term, i_term, d_term = self.pi.update(
+        u_cmd, e, p_term, i_term, d_term = self.pid.update(
             setpoint=sp,
             measurement=T,
             kp=kp,
@@ -597,6 +615,7 @@ class App(tk.Tk):
             kd=kd,
             deriv_points=d_smooth_points,
             dt_s=dt,
+            sample_time_s=now,
             u_ff=u_ff,
             u_min=u_min,
             u_max=u_max,
@@ -687,7 +706,7 @@ class App(tk.Tk):
         self.var_heater_channel.set(d.get("heater_channel", self.var_heater_channel.get()))
 
         if was_running and (not keep_int):
-            self.pi.reset_state()
+            self.pid.reset_state()
 
     def _refresh_preset_list(self):
         names = sorted(self.presets.keys())
@@ -746,8 +765,8 @@ class App(tk.Tk):
         if self.var_keep_integral_on_tune.get():
             return
         # If running and user changes Kp/Ki/u_ff, reset integrator
-        self.pi.reset_state()
-        self.var_i_term.set(f"{self.pi.integral_uW:.5f} µW")
+        self.pid.reset_state()
+        self.var_i_term.set(f"{self.pid.integral_uW:.5f} µW")
         self.var_d_term.set("—")
 
     def _on_close(self):
