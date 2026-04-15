@@ -21,7 +21,7 @@ Notes:
 - Sample time defaults to 30 s, but is editable.
 
 Run:
-    python pi_ff_gui.py
+    python temperature_controller.py
 """
 
 import json
@@ -35,7 +35,7 @@ from collections import deque
 from statistics import stdev
 from tkinter import ttk, messagebox, simpledialog
 
-PRESET_FILE = "pi_ff_presets.json"
+PRESET_FILE = "presets.json"
 
 
 # ----------------------------------------------------------------------
@@ -163,11 +163,11 @@ class BlueforsController:
             'power': power_uW * 1e-6, # Applied manual power in Watts. The maximum power is 100 mA
             # 'power': '0.000001', # Applied manual power in Watts. The maximum power is 100 mA
         }
-        print("Sending command:", data)
+        # print("Sending command:", data)
         req = requests.post(url, json=data, timeout=self.TIMEOUT)
         req.raise_for_status()
         rtn = req.json()
-        print("Response:", rtn)
+        # print("Response:", rtn)
 
         return 
 
@@ -177,19 +177,25 @@ class BlueforsController:
 class PIWithFeedforward:
     def __init__(self):
         self.integral_uW = 0.0  # integral contribution already in µW
+        self.measurement_history = deque()
 
     def reset_integral(self):
         self.integral_uW = 0.0
 
-    def update(self, setpoint, measurement, kp, ki_per_s, dt_s, u_ff,
+    def reset_state(self):
+        self.integral_uW = 0.0
+        self.measurement_history.clear()
+
+    def update(self, setpoint, measurement, kp, ki_per_s, kd, deriv_points, dt_s, u_ff,
                u_min, u_max, antiwindup=True):
         """
-        Returns (u_cmd, error, p_term, i_term)
+        Returns (u_cmd, error, p_term, i_term, d_term)
 
         Implementation:
           e = setpoint - measurement
           integral_uW += (ki * e * dt)
-          u = u_ff + kp*e + integral_uW
+          d_term = -kd * d(measurement)/dt
+          u = u_ff + kp*e + integral_uW + d_term
 
         Anti-windup:
           If saturated and integration would drive further into saturation,
@@ -197,10 +203,22 @@ class PIWithFeedforward:
         """
         e = setpoint - measurement
         p = kp * e
+        window = max(2, int(deriv_points))
+        self.measurement_history.append(float(measurement))
+        while len(self.measurement_history) > window:
+            self.measurement_history.popleft()
+
+        if len(self.measurement_history) >= 2 and dt_s > 0:
+            d_meas_dt = (
+                self.measurement_history[-1] - self.measurement_history[0]
+            ) / (dt_s * (len(self.measurement_history) - 1))
+        else:
+            d_meas_dt = 0.0
+        d = -kd * d_meas_dt
 
         # Propose updated integral
         i_proposed = self.integral_uW + (ki_per_s * e * dt_s)
-        u_unsat = u_ff + p + i_proposed
+        u_unsat = u_ff + p + i_proposed + d
 
         # Saturate
         u = min(max(u_unsat, u_min), u_max)
@@ -226,8 +244,8 @@ class PIWithFeedforward:
 
         # Recompute terms with stored integral (in case we froze it)
         i = self.integral_uW
-        u_cmd = min(max(u_ff + p + i, u_min), u_max)
-        return u_cmd, e, p, i
+        u_cmd = min(max(u_ff + p + i + d, u_min), u_max)
+        return u_cmd, e, p, i, d
 
 
 # ----------------------------------------------------------------------
@@ -274,6 +292,8 @@ class App(tk.Tk):
         self.var_setpoint = tk.DoubleVar(value=0.050)     # e.g. K
         self.var_kp = tk.DoubleVar(value=0.01)            # µW / K
         self.var_ki = tk.DoubleVar(value=0.00001)         # µW / K / s
+        self.var_kd = tk.DoubleVar(value=0.0)             # µW * s / K
+        self.var_d_smooth_points = tk.IntVar(value=5)
         self.var_uff = tk.DoubleVar(value=3.0)            # µW
         self.var_dt = tk.DoubleVar(value=30.0)            # s
         self.var_u_min = tk.DoubleVar(value=0.0)          # µW
@@ -295,6 +315,7 @@ class App(tk.Tk):
         self.var_u_cmd = tk.StringVar(value="—")
         self.var_p_term = tk.StringVar(value="—")
         self.var_i_term = tk.StringVar(value="—")
+        self.var_d_term = tk.StringVar(value="—")
         self.var_status = tk.StringVar(value="Stopped")
 
         self._build_ui()
@@ -303,7 +324,9 @@ class App(tk.Tk):
         # Trace changes to Kp/Ki to optionally reset integral while running
         self.var_kp.trace_add("write", self._on_tune_param_changed)
         self.var_ki.trace_add("write", self._on_tune_param_changed)
+        self.var_kd.trace_add("write", self._on_tune_param_changed)
         self.var_uff.trace_add("write", self._on_tune_param_changed)
+        self.var_d_smooth_points.trace_add("write", self._on_tune_param_changed)
 
         # Poll temperature display (even when stopped) at a gentle rate
         self.after(500, self._idle_poll_temperature)
@@ -348,13 +371,15 @@ class App(tk.Tk):
         add_row(0, "Setpoint", self.var_setpoint, "K")
         add_row(1, "Kp", self.var_kp, "µW/K")
         add_row(2, "Ki", self.var_ki, "µW/K/s")
-        add_row(3, "Feedforward u_ff", self.var_uff, "µW")
-        add_row(4, "Sample time dt", self.var_dt, "s")
-        add_row(5, "Heater min", self.var_u_min, "µW")
-        add_row(6, "Heater max", self.var_u_max, "µW")
+        add_row(3, "Kd", self.var_kd, "µW*s/K")
+        add_row(4, "Derivative smoothing", self.var_d_smooth_points, "pts")
+        add_row(5, "Feedforward u_ff", self.var_uff, "µW")
+        add_row(6, "Sample time dt", self.var_dt, "s")
+        add_row(7, "Heater min", self.var_u_min, "µW")
+        add_row(8, "Heater max", self.var_u_max, "µW")
 
         opts = ttk.Frame(frm)
-        opts.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        opts.grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Checkbutton(opts, text="Reset integral on Start",
                         variable=self.var_reset_integral_on_start).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(opts, text="Keep integral when tuning Kp/Ki/u_ff",
@@ -364,7 +389,7 @@ class App(tk.Tk):
 
         # Controls
         ctrl = ttk.Frame(frm)
-        ctrl.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ctrl.grid(row=10, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self.btn_start = ttk.Button(ctrl, text="Start", command=self.start, state="disabled")
         self.btn_stop = ttk.Button(ctrl, text="Stop", command=self.stop, state="disabled")
         self.btn_start.grid(row=0, column=0, padx=(0, 8))
@@ -390,7 +415,8 @@ class App(tk.Tk):
         live_row(3, "Heater power", self.var_u_cmd)
         live_row(4, "  P term", self.var_p_term)
         live_row(5, "  I term", self.var_i_term)
-        live_row(6, "Status", self.var_status)
+        live_row(6, "  D term", self.var_d_term)
+        live_row(7, "Status", self.var_status)
 
         # Presets
         presets = ttk.LabelFrame(self, text="Presets")
@@ -498,7 +524,7 @@ class App(tk.Tk):
             messagebox.showinfo("Controller", "Connect to the controller first.")
             return
         if self.var_reset_integral_on_start.get():
-            self.pi.reset_integral()
+            self.pi.reset_state()
 
         self.running = True
         self.last_update_time = None
@@ -513,7 +539,8 @@ class App(tk.Tk):
 
     def _reset_integral_now(self):
         self.pi.reset_integral()
-        self.var_i_term.set(f"{self.pi.integral_uW:.6g} µW")
+        self.var_i_term.set(f"{self.pi.integral_uW:.5f} µW")
+        self.var_d_term.set("—")
 
     def _record_temperature(self, temperature):
         self.temp_history.append(float(temperature))
@@ -555,16 +582,20 @@ class App(tk.Tk):
         sp = float(self.var_setpoint.get())
         kp = float(self.var_kp.get())
         ki = float(self.var_ki.get())
+        kd = float(self.var_kd.get())
+        d_smooth_points = int(self.var_d_smooth_points.get())
         u_ff = float(self.var_uff.get())
         u_min = float(self.var_u_min.get())
         u_max = float(self.var_u_max.get())
         antiwindup = bool(self.var_antiwindup.get())
 
-        u_cmd, e, p_term, i_term = self.pi.update(
+        u_cmd, e, p_term, i_term, d_term = self.pi.update(
             setpoint=sp,
             measurement=T,
             kp=kp,
             ki_per_s=ki,
+            kd=kd,
+            deriv_points=d_smooth_points,
             dt_s=dt,
             u_ff=u_ff,
             u_min=u_min,
@@ -583,11 +614,12 @@ class App(tk.Tk):
 
         # Update readouts
         self._record_temperature(T)
-        self.var_temp.set(f"{T:.4f} K")
-        self.var_error.set(f"{e:.4f} K")
-        self.var_u_cmd.set(f"{u_cmd:.4f} µW")
-        self.var_p_term.set(f"{p_term:.4f} µW")
-        self.var_i_term.set(f"{i_term:.4f} µW")
+        self.var_temp.set(f"{T:.5f} K")
+        self.var_error.set(f"{e:.5f} K")
+        self.var_u_cmd.set(f"{u_cmd:.5f} µW")
+        self.var_p_term.set(f"{p_term:.5f} µW")
+        self.var_i_term.set(f"{i_term:.5f} µW")
+        self.var_d_term.set(f"{d_term:.5f} µW")
 
         # Schedule next tick aligned to dt_cfg
         self.after(int(dt_cfg * 1000), self._control_tick)
@@ -597,8 +629,8 @@ class App(tk.Tk):
             return
         try:
             T = float(self.controller.get_temperature(channel_number=int(self.var_temp_channel.get())))
-            self._record_temperature(T)
-            self.var_temp.set(f"{T:.4f} K")
+            # self._record_temperature(T)
+            self.var_temp.set(f"{T:.5f} K")
         except LookupError:
             pass
         except Exception:
@@ -615,6 +647,8 @@ class App(tk.Tk):
             "setpoint": float(self.var_setpoint.get()),
             "kp": float(self.var_kp.get()),
             "ki": float(self.var_ki.get()),
+            "kd": float(self.var_kd.get()),
+            "d_smooth_points": int(self.var_d_smooth_points.get()),
             "u_ff": float(self.var_uff.get()),
             "dt": float(self.var_dt.get()),
             "u_min": float(self.var_u_min.get()),
@@ -637,6 +671,8 @@ class App(tk.Tk):
         self.var_setpoint.set(d.get("setpoint", self.var_setpoint.get()))
         self.var_kp.set(d.get("kp", self.var_kp.get()))
         self.var_ki.set(d.get("ki", self.var_ki.get()))
+        self.var_kd.set(d.get("kd", self.var_kd.get()))
+        self.var_d_smooth_points.set(d.get("d_smooth_points", self.var_d_smooth_points.get()))
         self.var_uff.set(d.get("u_ff", self.var_uff.get()))
         self.var_dt.set(d.get("dt", self.var_dt.get()))
         self.var_u_min.set(d.get("u_min", self.var_u_min.get()))
@@ -651,7 +687,7 @@ class App(tk.Tk):
         self.var_heater_channel.set(d.get("heater_channel", self.var_heater_channel.get()))
 
         if was_running and (not keep_int):
-            self.pi.reset_integral()
+            self.pi.reset_state()
 
     def _refresh_preset_list(self):
         names = sorted(self.presets.keys())
@@ -710,8 +746,9 @@ class App(tk.Tk):
         if self.var_keep_integral_on_tune.get():
             return
         # If running and user changes Kp/Ki/u_ff, reset integrator
-        self.pi.reset_integral()
-        self.var_i_term.set(f"{self.pi.integral_uW:.6g} µW")
+        self.pi.reset_state()
+        self.var_i_term.set(f"{self.pi.integral_uW:.5f} µW")
+        self.var_d_term.set("—")
 
     def _on_close(self):
         # Best-effort: stop loop and optionally set heater to feedforward or 0
