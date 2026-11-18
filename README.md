@@ -11,6 +11,8 @@ Tkinter GUI for closed-loop temperature control using PID with a feedforward ter
 - Optional integral reset on start
 - Optional integral reset when tuning while the loop is running
 - Derivative smoothing based on a rolling linear-fit window
+- Numeric settings are committed on Enter or when leaving the field
+- Transient controller errors are retried before the loop is stopped
 - Live readouts for temperature, error, heater output, and PID terms
 - Rolling standard deviation over the last 100 temperature samples
 - JSON-based preset save/load/delete support
@@ -76,6 +78,10 @@ The GUI exposes:
 - Minimum and maximum heater output
 - Integral handling and anti-windup options
 
+Numeric edits do not affect the running loop while they are being typed. Press
+Enter, Tab, or click into another field to validate and commit a value. Invalid
+input is discarded and the last committed value is restored.
+
 Live status fields show:
 
 - Current temperature
@@ -100,3 +106,8 @@ Presets are stored in [`presets.json`](/home/tomren/repo/tempcontrol/presets.jso
 ## Shutdown Behavior
 
 Closing the window stops the control loop and closes the controller connection if the controller provides a `close()` method.
+
+During normal operation, a failed temperature read or heater update is retried
+at the next configured control interval while the previous heater output remains
+in effect. Three consecutive failures stop the loop, and the Live status retains
+the operation and error that caused the stop.

@@ -36,6 +36,7 @@ from statistics import stdev
 from tkinter import ttk, messagebox, simpledialog
 
 PRESET_FILE = "presets.json"
+MAX_CONSECUTIVE_CONTROL_FAILURES = 3
 
 
 # ----------------------------------------------------------------------
@@ -293,6 +294,9 @@ class App(tk.Tk):
         self.pid = PIDWithFeedforward()
         self.running = False
         self.last_update_time = None
+        self._control_after_id = None
+        self._consecutive_control_failures = 0
+        self._numeric_entries = []
 
         # Presets
         self.presets = load_presets()
@@ -351,12 +355,29 @@ class App(tk.Tk):
         ttk.Label(controller_frame, text="IP address").grid(row=0, column=0, sticky="w")
         ttk.Entry(controller_frame, textvariable=self.var_controller_ip, width=18).grid(row=0, column=1, sticky="ew")
         ttk.Label(controller_frame, text="Timeout (s)").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(controller_frame, textvariable=self.var_controller_timeout, width=8).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        self._add_numeric_entry(
+            controller_frame,
+            self.var_controller_timeout,
+            "Timeout",
+            width=8,
+        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         ttk.Label(controller_frame, text="Thermometer channel").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(controller_frame, textvariable=self.var_temp_channel, width=8).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        self._add_numeric_entry(
+            controller_frame,
+            self.var_temp_channel,
+            "Thermometer channel",
+            width=8,
+            integer=True,
+        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
         ttk.Label(controller_frame, text="Heater channel").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(controller_frame, textvariable=self.var_heater_channel, width=8).grid(row=3, column=1, sticky="w", pady=(6, 0))
+        self._add_numeric_entry(
+            controller_frame,
+            self.var_heater_channel,
+            "Heater channel",
+            width=8,
+            integer=True,
+        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
 
         self.btn_connect = ttk.Button(controller_frame, text="Connect", command=self.connect_controller)
         self.btn_connect.grid(row=0, column=4, rowspan=2, sticky="w", padx=(12, 0))
@@ -372,9 +393,15 @@ class App(tk.Tk):
         frm.grid(row=1, column=0, sticky="nsew", **pad)
         self.columnconfigure(0, weight=1)
 
-        def add_row(r, label, var, unit="", width=12):
+        def add_row(r, label, var, unit="", width=12, integer=False):
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w")
-            ent = ttk.Entry(frm, textvariable=var, width=width)
+            ent = self._add_numeric_entry(
+                frm,
+                var,
+                label,
+                width=width,
+                integer=integer,
+            )
             ent.grid(row=r, column=1, sticky="w")
             ttk.Label(frm, text=unit).grid(row=r, column=2, sticky="w")
             return ent
@@ -386,7 +413,7 @@ class App(tk.Tk):
         add_row(1, "Kp", self.var_kp, "µW/K")
         add_row(2, "Ki", self.var_ki, "µW/K/s")
         add_row(3, "Kd", self.var_kd, "µW*s/K")
-        add_row(4, "Derivative smoothing", self.var_d_smooth_points, "pts")
+        add_row(4, "Derivative smoothing", self.var_d_smooth_points, "pts", integer=True)
         add_row(5, "Feedforward u_ff", self.var_uff, "µW")
         add_row(6, "Sample time dt", self.var_dt, "s")
         add_row(7, "Heater min", self.var_u_min, "µW")
@@ -454,6 +481,52 @@ class App(tk.Tk):
         # Quit cleanly
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_connection_status("Disconnected", "#b91c1c")
+
+    @staticmethod
+    def _numeric_text(value):
+        return str(value)
+
+    def _add_numeric_entry(self, parent, active_var, label, width=12, integer=False):
+        """Create an entry whose text is committed to active_var explicitly."""
+        draft_var = tk.StringVar(value=self._numeric_text(active_var.get()))
+        entry = ttk.Entry(parent, textvariable=draft_var, width=width)
+
+        def sync_draft(*_args):
+            draft_var.set(self._numeric_text(active_var.get()))
+
+        active_var.trace_add("write", sync_draft)
+        entry.bind(
+            "<Return>",
+            lambda _event: self._commit_numeric_entry(
+                draft_var, active_var, label, integer
+            ),
+        )
+        entry.bind(
+            "<FocusOut>",
+            lambda _event: self._commit_numeric_entry(
+                draft_var, active_var, label, integer
+            ),
+        )
+        self._numeric_entries.append((entry, draft_var, active_var, label, integer))
+        return entry
+
+    def _commit_numeric_entry(self, draft_var, active_var, label, integer):
+        text = draft_var.get().strip()
+        try:
+            value = int(text) if integer else float(text)
+        except (TypeError, ValueError):
+            draft_var.set(self._numeric_text(active_var.get()))
+            messagebox.showerror(
+                "Invalid value",
+                f"{label} must be {'an integer' if integer else 'a number'}.",
+                parent=self,
+            )
+            return "break"
+
+        if value != active_var.get():
+            active_var.set(value)
+        draft_var.set(self._numeric_text(active_var.get()))
+        return "break"
 
     def _set_connection_status(self, text, color):
         self.var_connection_status.set(text)
@@ -544,16 +617,60 @@ class App(tk.Tk):
         if self.var_reset_integral_on_start.get():
             self.pid.reset_state()
 
+        self._cancel_control_tick()
         self.running = True
         self.last_update_time = None
+        self._consecutive_control_failures = 0
         self.var_status.set("Running")
         self._set_start_button_state()
         self._control_tick()
 
-    def stop(self):
+    def stop(self, reason="Stopped"):
         self.running = False
-        self.var_status.set("Stopped")
+        self._cancel_control_tick()
+        self.var_status.set(reason)
         self._set_start_button_state()
+
+    def _cancel_control_tick(self):
+        if self._control_after_id is None:
+            return
+        try:
+            self.after_cancel(self._control_after_id)
+        except tk.TclError:
+            pass
+        self._control_after_id = None
+
+    def _schedule_control_tick(self, delay_ms):
+        if not self.running:
+            return
+        self._cancel_control_tick()
+        self._control_after_id = self.after(
+            max(0, int(delay_ms)),
+            self._run_scheduled_control_tick,
+        )
+
+    def _run_scheduled_control_tick(self):
+        self._control_after_id = None
+        self._control_tick()
+
+    def _handle_control_failure(self, operation, exc, delay_ms):
+        self._consecutive_control_failures += 1
+        failure_count = self._consecutive_control_failures
+        short_error = self._short_error_text(exc, max_len=80)
+        self.last_update_time = None
+
+        if failure_count >= MAX_CONSECUTIVE_CONTROL_FAILURES:
+            self.stop(
+                f"Stopped — {operation} failed after {failure_count} attempts: "
+                f"{short_error}"
+            )
+            return
+
+        self.var_status.set(
+            f"{operation} failed ({failure_count}/{MAX_CONSECUTIVE_CONTROL_FAILURES}); "
+            f"retrying: {short_error}"
+        )
+        self._schedule_control_tick(delay_ms)
 
     def _reset_integral_now(self):
         self.pid.reset_integral()
@@ -589,12 +706,15 @@ class App(tk.Tk):
         except LookupError:
             self.last_update_time = None
             self.var_status.set(f"Waiting for thermometer ch {int(self.var_temp_channel.get())}")
-            self.after(250, self._control_tick)
+            self._schedule_control_tick(250)
             return
         except Exception as e:
             traceback.print_exc()
-            self.var_status.set(f"Error reading temperature: {e}")
-            self.stop()
+            self._handle_control_failure(
+                "Temperature read",
+                e,
+                int(dt_cfg * 1000),
+            )
             return
 
         sp = float(self.var_setpoint.get())
@@ -627,9 +747,15 @@ class App(tk.Tk):
             self.controller.set_heater(u_cmd, channel_number=int(self.var_heater_channel.get()))
         except Exception as e2:
             traceback.print_exc()
-            self.var_status.set(f"Error setting heater: {e2}")
-            self.stop()
+            self._handle_control_failure(
+                "Heater update",
+                e2,
+                int(dt_cfg * 1000),
+            )
             return
+
+        self._consecutive_control_failures = 0
+        self.var_status.set("Running")
 
         # Update readouts
         self._record_temperature(T)
@@ -641,7 +767,7 @@ class App(tk.Tk):
         self.var_d_term.set(f"{d_term:.5f} µW")
 
         # Schedule next tick aligned to dt_cfg
-        self.after(int(dt_cfg * 1000), self._control_tick)
+        self._schedule_control_tick(int(dt_cfg * 1000))
 
     def _idle_poll_temperature_once(self):
         if self.controller is None:
